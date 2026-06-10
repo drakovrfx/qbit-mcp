@@ -1,5 +1,7 @@
 import os
-from typing import Any
+import time
+import datetime
+from typing import Any, Optional
 from fastmcp import FastMCP
 import qbittorrentapi
 from dotenv import load_dotenv
@@ -52,15 +54,10 @@ def search_torrents(query: str, plugins: str = "all", category: str = "all") -> 
     """
     client = get_qbt_client()
 
-    # Start search
     search_job = client.search_start(pattern=query, plugins=plugins, category=category)
-
-    # Get search job ID
     search_id = search_job.id
 
-    # Wait for results (check status until complete or timeout)
-    import time
-    max_wait = 30  # seconds
+    max_wait = 30
     waited = 0
 
     while waited < max_wait:
@@ -70,13 +67,9 @@ def search_torrents(query: str, plugins: str = "all", category: str = "all") -> 
         time.sleep(1)
         waited += 1
 
-    # Get results
     results = client.search_results(search_id=search_id, limit=100)
-
-    # Stop search
     client.search_delete(search_id=search_id)
 
-    # Format results
     formatted_results = []
     for result in results.results:
         formatted_results.append({
@@ -107,7 +100,7 @@ def download_torrent(
     Args:
         url: Torrent URL or magnet link
         save_path: Directory to save the torrent (optional)
-        category: Category to assign to the torrent (optional)
+        category: Category to assign to the torrent — use this to route to the correct folder (optional)
         tags: Comma-separated tags to assign (optional)
         paused: Start torrent in paused state (default: False)
 
@@ -116,7 +109,6 @@ def download_torrent(
     """
     client = get_qbt_client()
 
-    # Prepare options
     options = {}
     if save_path:
         options["savepath"] = save_path
@@ -127,7 +119,6 @@ def download_torrent(
     if paused:
         options["paused"] = "true"
 
-    # Add torrent
     try:
         result = client.torrents_add(urls=url, **options)
 
@@ -152,25 +143,87 @@ def download_torrent(
 
 
 @mcp.tool()
-def get_torrent_info(torrent_hash: str = None) -> list[dict[str, Any]]:
+def get_torrent_info(
+    torrent_hash: Optional[str] = None,
+    filter: Optional[str] = None,
+    category: Optional[str] = None,
+    tag: Optional[str] = None,
+    sort: Optional[str] = None,
+    reverse: bool = False,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> list[dict[str, Any]]:
     """
     Get information about torrents in qBittorrent.
 
     Args:
-        torrent_hash: Specific torrent hash to get info for (optional, returns all if not provided)
+        torrent_hash: Specific torrent hash (optional, returns all if not provided)
+        filter: Filter by state. Options: all, downloading, seeding, completed,
+                paused, active, inactive, resumed, stalled, stalled_uploading,
+                stalled_downloading, errored (optional)
+        category: Filter by category name (optional, use empty string "" for uncategorised)
+        tag: Filter by tag name (optional, use empty string "" for untagged)
+        sort: Field to sort by, e.g. "last_activity", "added_on", "ratio",
+              "size", "name", "state" (optional)
+        reverse: Reverse the sort order (default: False)
+        limit: Maximum number of torrents to return — use this to avoid large
+               responses. Recommended: 200 or less (optional)
+        offset: Number of torrents to skip — combine with limit for pagination,
+                e.g. offset=0&limit=200, then offset=200&limit=200 (optional)
 
     Returns:
-        List of torrent information
+        List of torrent information. Total count is included as the first element
+        when using limit/offset so you know how many pages to expect.
     """
     client = get_qbt_client()
 
+    # Build kwargs — only pass params that are explicitly set,
+    # so we don't override qBittorrent defaults with None values
+    kwargs = {}
     if torrent_hash:
-        torrents = client.torrents_info(torrent_hashes=torrent_hash)
-    else:
-        torrents = client.torrents_info()
+        kwargs["torrent_hashes"] = torrent_hash
+    if filter:
+        kwargs["status_filter"] = filter
+    if category is not None:          # allow empty string for "no category"
+        kwargs["category"] = category
+    if tag is not None:               # allow empty string for "no tag"
+        kwargs["tag"] = tag
+    if sort:
+        kwargs["sort"] = sort
+    if reverse:
+        kwargs["reverse"] = reverse
+    if limit is not None:
+        kwargs["limit"] = limit
+    if offset is not None:
+        kwargs["offset"] = offset
 
+    torrents = client.torrents_info(**kwargs)
+
+    now = int(datetime.datetime.now().timestamp())
     result = []
+
+    # When paginating, prepend a metadata entry so the caller knows
+    # the total count without fetching everything
+    if limit is not None or offset is not None:
+        total = client.torrents_info(
+            status_filter=filter or "all",
+            category=category,
+            tag=tag,
+        )
+        result.append({
+            "_meta": True,
+            "total_count": len(total),
+            "returned_count": len(torrents),
+            "offset": offset or 0,
+            "limit": limit,
+        })
+
     for torrent in torrents:
+        added = torrent.added_on
+        last_active = torrent.last_activity
+        completed = getattr(torrent, "completion_on", None)
+        seeding_time = getattr(torrent, "seeding_time", None)
+
         result.append({
             "hash": torrent.hash,
             "name": torrent.name,
@@ -186,7 +239,15 @@ def get_torrent_info(torrent_hash: str = None) -> list[dict[str, Any]]:
             "ratio": torrent.ratio,
             "category": torrent.category,
             "tags": torrent.tags,
-            "save_path": torrent.save_path
+            "save_path": torrent.save_path,
+            "added_on": added,
+            "added_on_readable": datetime.datetime.fromtimestamp(added).strftime('%Y-%m-%d') if added else "unknown",
+            "last_activity": last_active,
+            "last_activity_readable": datetime.datetime.fromtimestamp(last_active).strftime('%Y-%m-%d') if last_active else "unknown",
+            "days_since_activity": int((now - last_active) / 86400) if last_active else None,
+            "completion_on": completed,
+            "completion_on_readable": datetime.datetime.fromtimestamp(completed).strftime('%Y-%m-%d') if completed else None,
+            "seeding_time_days": round(seeding_time / 86400, 1) if seeding_time else None,
         })
 
     return result
